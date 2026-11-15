@@ -1,0 +1,101 @@
+name: Verify Cloudflare domain
+
+on:
+  workflow_dispatch:
+    inputs:
+      phase:
+        description: First inspect the domain; enable Email Routing only after NS delegation is active.
+        type: choice
+        required: true
+        default: inspect
+        options:
+          - inspect
+          - enable_email_routing
+
+permissions: {}
+
+concurrency:
+  group: cloud-mail-domain-setup
+  cancel-in-progress: false
+
+jobs:
+  verify-domain:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+      SETUP_PHASE: ${{ inputs.phase }}
+    steps:
+      - name: Verify domain and show assigned nameservers
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json, os, re, urllib.request, urllib.parse, urllib.error
+          
+          token = os.environ.get("CLOUDFLARE_API_TOKEN", "")
+          account = os.environ.get("CLOUDFLARE_ACCOUNT_ID", "")
+          domain = "wsmail2026.de5.net"
+          phase = os.environ.get("SETUP_PHASE", "inspect")
+          if not token or not re.fullmatch(r"[0-9a-fA-F]{32}", account):
+              raise SystemExit("Add CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID as repository secrets first.")
+          
+          def api(method, path, payload=None):
+              data = None if payload is None else json.dumps(payload).encode()
+              request = urllib.request.Request("https://api.cloudflare.com/client/v4" + path, data=data,
+                  headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"}, method=method)
+              try:
+                  with urllib.request.urlopen(request, timeout=45) as response:
+                      result = json.load(response)
+              except urllib.error.HTTPError as error:
+                  try:
+                      result = json.load(error)
+                  except Exception:
+                      raise RuntimeError(f"Cloudflare returned HTTP {error.code}; no response body logged.") from None
+              if not result.get("success"):
+                  errors = [{"code": e.get("code"), "message": e.get("message")} for e in result.get("errors", [])]
+                  raise RuntimeError("Cloudflare API rejected the request: " + json.dumps(errors, ensure_ascii=False))
+              return result.get("result")
+          
+          query = urllib.parse.urlencode({"name": domain, "account.id": account})
+          zones = api("GET", "/zones?" + query)
+          if len(zones) > 1:
+              raise SystemExit("More than one matching zone returned; stop for review.")
+          if zones:
+              zone = zones[0]
+              print("Reusing the existing domain; no duplicate zone created.")
+          else:
+              zone = api("POST", "/zones", {"name": domain, "account": {"id": account}, "type": "full"})
+              print("Cloudflare accepted the domain and created its pending DNS zone.")
+          if zone.get("account", {}).get("id") != account:
+              raise SystemExit("Zone/account mismatch; stop for review.")
+          plan = zone.get("plan") or {}
+          if plan.get("price", 0) != 0:
+              raise SystemExit("This domain has a non-free plan; no plan or subscription changes were made.")
+          zone_id = zone["id"]
+          zone = api("GET", "/zones/" + zone_id)
+          lines = ["## Cloudflare domain verification", "", "Domain: " + domain,
+                   "", "Status: " + zone.get("status", "unknown"), "", "Assigned nameservers:"]
+          for nameserver in zone.get("name_servers", []):
+              lines.append("- " + nameserver)
+          print(chr(10).join(lines))
+          
+          if phase == "enable_email_routing":
+              if zone.get("status") != "active":
+                  raise SystemExit("Nameserver delegation is not active yet. No Email Routing changes were made.")
+              routing = api("POST", "/zones/" + zone_id + "/email/routing/dns", {})
+              lines.extend(["", "Email Routing DNS configuration accepted by Cloudflare."])
+          else:
+              lines.extend(["", "Inspection complete. Email Routing has not been enabled by this run."])
+          
+          try:
+              routing = api("GET", "/zones/" + zone_id + "/email/routing")
+              lines.extend(["", "Email Routing enabled: " + str(routing.get("enabled", False)),
+                            "Email Routing status: " + str(routing.get("status", "unknown"))])
+          except RuntimeError as error:
+              lines.extend(["", "Email Routing check: " + str(error)])
+          
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as summary:
+              summary.write(chr(10).join(lines) + chr(10))
+          print("Finished. No paid subscription APIs were called.")
+          PY
